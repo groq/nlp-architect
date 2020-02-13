@@ -28,7 +28,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from nlp_architect.common import Config
-
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +41,16 @@ def get_dynamic_scale(x, bits, with_grad=False):
     return get_scale(bits, threshold)
 
 
-def get_scale(bits, threshold):
+@torch.jit.script
+def calc_max_quant_value(bits: int):
+    """Calculate the maximum symmetric quantized value according to number of bits"""
+    return 2 ** (bits - 1) - 1
+
+@torch.jit.script
+def get_scale(bits: int, threshold):
     """Calculate scale for quantization according to some constant and number of bits"""
     return calc_max_quant_value(bits) / threshold
 
-
-def calc_max_quant_value(bits):
-    """Calculate the maximum symmetric quantized value according to number of bits"""
-    return 2 ** (bits - 1) - 1
 
 
 def quantize(input, scale, bits):
@@ -81,9 +83,9 @@ class FakeLinearQuantizationWithSTE(torch.autograd.Function):
 
 
 class QuantizationMode(Enum):
-    NONE = auto()
-    DYNAMIC = auto()
-    EMA = auto()
+    NONE = 1
+    DYNAMIC = 2
+    EMA = 3
 
 
 _fake_quantize = FakeLinearQuantizationWithSTE.apply
@@ -208,6 +210,66 @@ class QuantizedLayer(ABC):
         return super().extra_repr() + s
 
 
+def linear_if(input, weight, bias: Optional[torch.Tensor]):
+    output = input.matmul(weight.t())
+    if bias is not None:
+        output += bias
+    ret = output
+    return ret
+
+# def linear_where(input, weight, bias: Optional[torch.Tensor]):
+#     output = input.matmul(weight.t())
+#     cond = torch.BoolTensor( [ int( bias as not None ) ] )
+#     ret = torch.where(cond, output + bias, output)
+#     return ret
+
+# this is only safe because this code is currently only invoked
+# on a model that always has a non null bias
+
+# onnx-tf has no If -> cond mapping currently
+
+# an alternative would be to create bias_zero tensor of the same shape
+# as output, and a conditional bias_cond tensor of bools of the same shape,
+# as torch, onnx, and TF all have `where`
+
+# note that there is no way to get rid of an optional hint which exports to
+# TF so we simply stick our head in the sand
+
+def linear(input, weight, bias):
+    output = input.matmul(weight.t())
+    output += bias
+    ret = output
+    return ret
+
+def quantize_inference(input, scale, bits: int):
+    """Do linear quantization to input according to a scale and number of bits"""
+    thresh = calc_max_quant_value(bits)
+    return input.mul(scale).round().clamp(-thresh, thresh)
+
+
+@torch.jit.script
+def get_activation_scale_inference(activation, threshold, activation_bits: int, mode: int):
+    if mode == 2: # DYNAMIC
+        threshold = activation.abs().max()
+    scale = get_scale(activation_bits, threshold)
+    return scale
+
+@torch.jit.script
+def inference_quantized_forward_linear(
+        input,
+        weight_scale,
+        quantized_weight,
+        quantized_bias,
+        activation_bits: int,
+        input_threshold,
+        mode: int):
+    input_scale = get_activation_scale_inference(input, input_threshold, activation_bits, mode)
+    bias_scale = weight_scale * input_scale
+    quantized_input = quantize_inference(input, input_scale, activation_bits)
+    scaled_input = linear(quantized_input, quantized_weight, quantized_bias)
+    dequantized_output = dequantize(scaled_input, bias_scale)
+    return bias_scale, dequantized_output
+
 class QuantizedLinear(QuantizedLayer, nn.Linear):
     """Linear layer with quantization aware training capability"""
 
@@ -264,16 +326,32 @@ class QuantizedLinear(QuantizedLayer, nn.Linear):
         """Simulate quantized inference. quantize input and perform calculation with only integer numbers.
         This function should only be used while doing inference"""
         assert not self.training, "should only be called when not training"
-        input_scale = self._get_input_scale(input)
-        self.bias_scale = self.weight_scale * input_scale
-        quantized_input = quantize(input, input_scale, self.activation_bits)
-        out = F.linear(quantized_input, self.quantized_weight, self.quantized_bias)
-        # TODO(ofir) fuse the operation of requantization with dequantiz
-        out = dequantize(out, self.bias_scale)
-        if self.requantize_output:
-            output_scale = self._get_output_scale(out)
-            out = dequantize(quantize(out, output_scale, self.activation_bits), output_scale)
+        bias_scale, out = inference_quantized_forward_linear(
+            input,
+            self.weight_scale,
+            self.quantized_weight,
+            self.quantized_bias,
+            self.activation_bits,
+            self.input_thresh,
+            self.mode.value
+        )
+        self.bias_scale = bias_scale
         return out
+
+    # def inference_quantized_forward(self, input):
+    #     """Simulate quantized inference. quantize input and perform calculation with only integer numbers.
+    #     This function should only be used while doing inference"""
+    #     assert not self.training, "should only be called when not training"
+    #     input_scale = self._get_input_scale(input)
+    #     self.bias_scale = self.weight_scale * input_scale
+    #     quantized_input = quantize(input, input_scale, self.activation_bits)
+    #     out = F.linear(quantized_input, self.quantized_weight, self.quantized_bias)
+    #     # TODO(ofir) fuse the operation of requantization with dequantiz
+    #     out = dequantize(out, self.bias_scale)
+    #     if self.requantize_output:
+    #         output_scale = self._get_output_scale(out)
+    #         out = dequantize(quantize(out, output_scale, self.activation_bits), output_scale)
+    #     return out
 
     def _eval(self):
         super()._eval()
@@ -340,6 +418,30 @@ class QuantizedLinear(QuantizedLayer, nn.Linear):
             ema.sub_((1 - self.ema_decay) * (ema - reduce_fn(input)))
 
 
+
+
+
+@torch.jit.script
+def inference_quantized_forward_embedding(
+        input,
+        quantized_weight,
+        padding_idx: Optional[int],
+        max_norm: Optional[float],
+        norm_type: float,
+        scale_grad_by_freq: bool,
+        sparse: bool,
+        weight_scale):
+    q_embeddings = F.embedding(
+        input,
+        quantized_weight,
+        padding_idx,
+        max_norm,
+        norm_type,
+        scale_grad_by_freq,
+        sparse,
+    )
+    return dequantize(q_embeddings, weight_scale)
+
 class QuantizedEmbedding(QuantizedLayer, nn.Embedding):
     """Embedding layer with quantization aware training capability"""
 
@@ -359,7 +461,7 @@ class QuantizedEmbedding(QuantizedLayer, nn.Embedding):
     def inference_quantized_forward(self, input):
         """forward to be used during inference"""
         assert not self.training, "should only be called when not training"
-        q_embeddings = F.embedding(
+        return inference_quantized_forward_embedding(
             input,
             self.quantized_weight,
             self.padding_idx,
@@ -367,9 +469,22 @@ class QuantizedEmbedding(QuantizedLayer, nn.Embedding):
             self.norm_type,
             self.scale_grad_by_freq,
             self.sparse,
+            self.weight_scale
         )
-        return dequantize(q_embeddings, self.weight_scale)
 
+    # def inference_quantized_forward(self, input):
+    #     """forward to be used during inference"""
+    #     assert not self.training, "should only be called when not training"
+    #     q_embeddings = F.embedding(
+    #         input,
+    #         self.quantized_weight,
+    #         self.padding_idx,
+    #         self.max_norm,
+    #         self.norm_type,
+    #         self.scale_grad_by_freq,
+    #         self.sparse,
+    #     )
+    #     return dequantize(q_embeddings, self.weight_scale)
 
 class QuantizationConfig(Config):
     """Quantization Configuration Object"""
