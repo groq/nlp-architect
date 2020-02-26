@@ -56,7 +56,8 @@ logger = logging.getLogger(__name__)
 QUANT_WEIGHTS_NAME = "quant_pytorch_model.bin"
 
 QUANT_BERT_PRETRAINED_CONFIG_ARCHIVE_MAP = {
-    "bert-base-uncased": "https://nlp-architect-data.s3-us-west-2.amazonaws.com/models/transformers/bert-base-uncased.json",  # noqa: E501
+  "q8bert-base-uncased": "https://nlp-architect-data.s3-us-west-2.amazonaws.com/models/transformers/bert-base-uncased.json",  # noqa: E501
+   "bert-base-uncased": "https://nlp-architect-data.s3-us-west-2.amazonaws.com/models/transformers/bert-base-uncased.json",  # noqa: E501
     "bert-large-uncased": "https://nlp-architect-data.s3-us-west-2.amazonaws.com/models/transformers/bert-large-uncased.json",  # noqa: E501
 }
 
